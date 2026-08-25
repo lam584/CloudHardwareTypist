@@ -415,7 +415,6 @@ clipboard_detection_paused = threading.Event()
 reset_validity_event = threading.Event()
 typing_lock = threading.Lock()
 typing_active_event = threading.Event()
-clipboard_trigger_suppressed_until = 0.0
 status_queue: queue.Queue[str] = queue.Queue()
 health_queue: queue.Queue[str] = queue.Queue()
 clipboard_preview_queue: queue.Queue[str] = queue.Queue()
@@ -593,7 +592,6 @@ def is_chinese_character(character: str) -> bool:
 
 
 def type_clipboard() -> None:
-    global clipboard_trigger_suppressed_until
     if not typing_lock.acquire(blocking=False):
         typing_active_event.clear()
         publish_status("输入任务正在运行")
@@ -683,9 +681,6 @@ def type_clipboard() -> None:
         except OSError:
             pass
         typing_lock.release()
-        # VMware Tools can mirror the clipboard immediately after virtual-key
-        # input. Do not interpret that echo as a new user copy operation.
-        clipboard_trigger_suppressed_until = time.monotonic() + 1.0
         typing_active_event.clear()
         publish_status(final_status)
 
@@ -786,15 +781,17 @@ def visible_applications() -> dict[str, set[str]]:
 
 
 def should_schedule_clipboard_update(
-    sequence_changed: bool,
     text_changed: bool,
     typing_active: bool,
-    now: float,
-    suppressed_until: float,
+    clipboard_text: str | None,
+    consumed_text: str | None,
 ) -> bool:
-    """Return True only for a user clipboard update, not a VMware sync echo."""
-    return (sequence_changed or text_changed) and not typing_active and (
-        text_changed or now >= suppressed_until
+    """Arm once for genuinely new text; reset is the only same-text rearm."""
+    return (
+        text_changed
+        and not typing_active
+        and clipboard_text is not None
+        and clipboard_text != consumed_text
     )
 
 
@@ -804,6 +801,7 @@ def run_automation_monitor() -> None:
     last_clipboard_text = read_unicode_clipboard()
     clipboard_preview_queue.put(last_clipboard_text or "")
     pending_sequence: int | None = None
+    consumed_clipboard_text = last_clipboard_text
     pending_since = 0.0
     last_health_update = 0.0
     last_text_check = 0.0
@@ -820,11 +818,10 @@ def run_automation_monitor() -> None:
         text_changed = clipboard_text is not None and clipboard_text != last_clipboard_text
         clipboard_updated = sequence_changed or text_changed
         trigger_update = should_schedule_clipboard_update(
-            sequence_changed,
             text_changed,
             typing_active_event.is_set(),
-            now,
-            clipboard_trigger_suppressed_until,
+            clipboard_text,
+            consumed_clipboard_text,
         )
         if clipboard_updated:
             clipboard_update_time_queue.put(time.strftime("%H:%M:%S"))
@@ -887,6 +884,7 @@ def run_automation_monitor() -> None:
                 time.sleep(focus_wait_seconds)
                 if target_application_has_focus():
                     pending_sequence = None
+                    consumed_clipboard_text = clipboard_text
                     start_typing_thread()
                 else:
                     publish_status("目标焦点已离开，继续等待")
