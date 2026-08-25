@@ -12,6 +12,8 @@ import ctypes
 from ctypes import wintypes
 import queue
 import random
+import socket
+import struct
 import sys
 import threading
 import time
@@ -90,6 +92,7 @@ GMEM_MOVEABLE = 0x0002
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
+MAPVK_VSC_TO_VK_EX = 3
 VK_F8 = 0x77
 VK_F9 = 0x78
 VK_F10 = 0x79
@@ -113,8 +116,21 @@ PM_REMOVE = 0x0001
 HWND_MESSAGE = -3
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 WUYING_FOREGROUND_PROCESSES = {"wuying.exe", "stream_viewer.exe"}
-target_process_names = set(WUYING_FOREGROUND_PROCESSES)
-target_application_label = "无影云电脑（wuying.exe / stream_viewer.exe）"
+VM_FOREGROUND_PROCESSES = {
+    # VMware Workstation / Player
+    "vmware.exe", "vmplayer.exe",
+    # Oracle VirtualBox
+    "virtualboxvm.exe",
+    # Hyper-V VMConnect
+    "vmconnect.exe",
+    # QEMU and common SPICE viewers
+    "qemu-system-x86_64.exe", "qemu-system-i386.exe",
+    "virt-viewer.exe", "remote-viewer.exe",
+}
+DEFAULT_TARGET_LABEL = "云电脑 / 虚拟机控制台（自动识别）"
+DEFAULT_TARGET_PROCESSES = WUYING_FOREGROUND_PROCESSES | VM_FOREGROUND_PROCESSES
+target_process_names = set(DEFAULT_TARGET_PROCESSES)
+target_application_label = DEFAULT_TARGET_LABEL
 ERROR_ALREADY_EXISTS = 183
 MUTEX_NAME = "Local\\CloudHardwareTypist-8DDA2254-3A4E-4C74-91A0-FB0D74F21F26"
 WINDOW_TITLE = "云端逐键输入助手"
@@ -124,6 +140,8 @@ SC_LEFT_SHIFT = 0x2A
 SC_ENTER = 0x1C
 SC_TAB = 0x0F
 SC_SPACE = 0x39
+VMWARE_VNC_HOST = "127.0.0.1"
+VMWARE_VNC_PORT = 5905
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -217,6 +235,10 @@ class RAWKEYBOARD(ctypes.Structure):
 
 user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 user32.SendInput.restype = wintypes.UINT
+user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+user32.MapVirtualKeyW.restype = wintypes.UINT
+user32.keybd_event.argtypes = (wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t)
+user32.keybd_event.restype = None
 user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.GetClipboardSequenceNumber.argtypes = ()
@@ -410,7 +432,105 @@ def append_runtime_log(message: str) -> None:
         log_file.write(f"[{timestamp}] {message}\n")
 
 
+class RfbKeyboardClient:
+    """Minimal RFB client used only for VMware's loopback VNC keyboard."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.socket = socket.create_connection((host, port), timeout=3.0)
+        self.socket.settimeout(3.0)
+        try:
+            self._handshake()
+        except BaseException:
+            self.socket.close()
+            raise
+
+    def _receive_exactly(self, count: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < count:
+            chunk = self.socket.recv(count - len(chunks))
+            if not chunk:
+                raise ConnectionError("VMware VNC 连接意外关闭")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def _handshake(self) -> None:
+        server_version = self._receive_exactly(12)
+        if not server_version.startswith(b"RFB "):
+            raise ConnectionError("VMware 返回了无效的 VNC 协议头")
+        self.socket.sendall(b"RFB 003.008\n")
+
+        security_count = self._receive_exactly(1)[0]
+        if security_count == 0:
+            reason_length = struct.unpack("!I", self._receive_exactly(4))[0]
+            reason = self._receive_exactly(reason_length).decode("utf-8", "replace")
+            raise PermissionError("VMware VNC 拒绝连接：" + reason)
+        security_types = self._receive_exactly(security_count)
+        if 1 not in security_types:
+            raise PermissionError("VMware VNC 未开放仅本机免认证连接")
+        self.socket.sendall(b"\x01")
+        security_result = struct.unpack("!I", self._receive_exactly(4))[0]
+        if security_result != 0:
+            raise PermissionError("VMware VNC 安全协商失败")
+
+        # Shared desktop prevents this keyboard-only connection from evicting
+        # VMware Workstation's own console session.
+        self.socket.sendall(b"\x01")
+        server_init = self._receive_exactly(24)
+        self.width, self.height = struct.unpack("!HH", server_init[:4])
+        name_length = struct.unpack("!I", server_init[20:24])[0]
+        if name_length:
+            self._receive_exactly(name_length)
+
+    def send_key(self, keysym: int, key_up: bool = False) -> None:
+        self.socket.sendall(struct.pack("!BBHI", 4, 0 if key_up else 1, 0, keysym))
+
+    def click(self, x: int, y: int) -> None:
+        self.socket.sendall(struct.pack("!BBHH", 5, 1, x, y))
+        self.socket.sendall(struct.pack("!BBHH", 5, 0, x, y))
+
+    def close(self) -> None:
+        self.socket.close()
+
+
+VNC_SHIFTED_BASE = dict(zip(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ_+{}|:\"<>?~!@#$%^&*()",
+    "abcdefghijklmnopqrstuvwxyz-=[]\\;',./`1234567890",
+    strict=True,
+))
+
+
+def send_vnc_character(client: RfbKeyboardClient, character: str) -> bool:
+    keysyms = {"\n": 0xFF0D, "\t": 0xFF09}
+    needs_shift = character in VNC_SHIFTED_BASE
+    base_character = VNC_SHIFTED_BASE.get(character, character)
+    keysym = keysyms.get(base_character, ord(base_character))
+    if needs_shift:
+        client.send_key(0xFFE1)  # Shift_L
+    client.send_key(keysym)
+    if not sleep_ms(random_timing("key_down")):
+        client.send_key(keysym, key_up=True)
+        if needs_shift:
+            client.send_key(0xFFE1, key_up=True)
+        return False
+    client.send_key(keysym, key_up=True)
+    if needs_shift:
+        client.send_key(0xFFE1, key_up=True)
+    return not cancel_event.is_set()
+
+
 def send_scan_code(scancode: int, key_up: bool = False) -> None:
+    # VMware Workstation reads its console keyboard through a legacy Windows
+    # keyboard path on some host configurations and silently discards SendInput
+    # scan-code events. keybd_event uses that compatible path. This decision is
+    # made per event so releasing Shift remains safe if focus changes mid-run.
+    if foreground_process_name() in {"vmware.exe", "vmplayer.exe"}:
+        virtual_key = user32.MapVirtualKeyW(scancode, MAPVK_VSC_TO_VK_EX)
+        if not virtual_key:
+            raise OSError(f"无法把扫描码 0x{scancode:02X} 转换为虚拟键")
+        flags = KEYEVENTF_KEYUP if key_up else 0
+        user32.keybd_event(virtual_key, scancode, flags, 0)
+        return
+
     flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if key_up else 0)
     event = INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(0, scancode, flags, 0, 0))
     sent = user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
@@ -477,6 +597,7 @@ def type_clipboard() -> None:
     typed_count = 0
     total_count = 0
     final_status = "等待剪贴板更新"
+    vnc_client: RfbKeyboardClient | None = None
     try:
         cancel_event.clear()
         text = read_unicode_clipboard()
@@ -500,14 +621,22 @@ def type_clipboard() -> None:
             return
 
         total_count = len(text.replace("\r", ""))
-        publish_status(f"正在输入：0 / {total_count}")
+        if foreground_process_name() in {"vmware.exe", "vmplayer.exe"}:
+            vnc_client = RfbKeyboardClient(VMWARE_VNC_HOST, VMWARE_VNC_PORT)
+            publish_status("VMware 虚拟键盘：正在输入 0 / " + str(total_count))
+        else:
+            publish_status(f"正在输入：0 / {total_count}")
         for character in text:
             if cancel_event.is_set():
                 final_status = f"输入已停止：{typed_count} / {total_count}"
                 return
             if character == "\r":
                 continue
-            if character == "\n":
+            if vnc_client is not None:
+                if not send_vnc_character(vnc_client, character):
+                    final_status = f"输入已停止：{typed_count} / {total_count}"
+                    return
+            elif character == "\n":
                 if not send_physical_key(SC_ENTER, False):
                     final_status = f"输入已停止：{typed_count} / {total_count}"
                     return
@@ -541,6 +670,8 @@ def type_clipboard() -> None:
         # be hidden behind the cloud client and make the progress appear frozen.
         final_status = f"硬件按键发送失败：{type(error).__name__}: {error}"
     finally:
+        if vnc_client is not None:
+            vnc_client.close()
         # Always release Shift if a run is interrupted while it is held.
         try:
             send_scan_code(SC_LEFT_SHIFT, key_up=True)
@@ -608,7 +739,15 @@ def target_application_has_focus() -> bool:
 
 def visible_applications() -> dict[str, set[str]]:
     applications: dict[str, set[str]] = {
-        "无影云电脑（wuying.exe / stream_viewer.exe）": set(WUYING_FOREGROUND_PROCESSES)
+        DEFAULT_TARGET_LABEL: set(DEFAULT_TARGET_PROCESSES),
+        "无影云电脑（wuying.exe / stream_viewer.exe）": set(WUYING_FOREGROUND_PROCESSES),
+        "VMware（vmware.exe / vmplayer.exe）": {"vmware.exe", "vmplayer.exe"},
+        "VirtualBox（VirtualBoxVM.exe）": {"virtualboxvm.exe"},
+        "Hyper-V（vmconnect.exe）": {"vmconnect.exe"},
+        "QEMU / SPICE 虚拟机控制台": {
+            "qemu-system-x86_64.exe", "qemu-system-i386.exe",
+            "virt-viewer.exe", "remote-viewer.exe",
+        },
     }
     seen_processes: set[str] = set()
 
@@ -931,7 +1070,7 @@ def run_gui() -> None:
         if matching_label is not None:
             application_var.set(matching_label)
         elif application_var.get() not in application_map:
-            application_var.set("无影云电脑（wuying.exe / stream_viewer.exe）")
+            application_var.set(DEFAULT_TARGET_LABEL)
             change_target_application()
 
     application_combo.bind("<<ComboboxSelected>>", change_target_application)
