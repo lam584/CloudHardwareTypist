@@ -131,6 +131,8 @@ DEFAULT_TARGET_LABEL = "云电脑 / 虚拟机控制台（自动识别）"
 DEFAULT_TARGET_PROCESSES = WUYING_FOREGROUND_PROCESSES | VM_FOREGROUND_PROCESSES
 target_process_names = set(DEFAULT_TARGET_PROCESSES)
 target_application_label = DEFAULT_TARGET_LABEL
+target_window_handle: int | None = None
+application_window_handles: dict[str, int] = {}
 ERROR_ALREADY_EXISTS = 183
 MUTEX_NAME = "Local\\CloudHardwareTypist-8DDA2254-3A4E-4C74-91A0-FB0D74F21F26"
 WINDOW_TITLE = "云端逐键输入助手"
@@ -688,6 +690,9 @@ def type_clipboard() -> None:
 def start_typing_thread() -> None:
     if typing_lock.locked() or typing_active_event.is_set():
         return
+    if not target_application_has_focus():
+        publish_status("目标窗口未获得焦点，未触发输入")
+        return
     # Close the small race between starting the thread and acquiring the lock.
     typing_active_event.set()
     threading.Thread(target=type_clipboard, name="cloud-hardware-typist", daemon=True).start()
@@ -740,10 +745,14 @@ def foreground_process_name() -> str | None:
 
 
 def target_application_has_focus() -> bool:
-    return foreground_process_name() in target_process_names
+    foreground_window = user32.GetForegroundWindow()
+    if target_window_handle is not None:
+        return foreground_window == target_window_handle
+    return process_name_for_window(foreground_window) in target_process_names
 
 
 def visible_applications() -> dict[str, set[str]]:
+    application_window_handles.clear()
     applications: dict[str, set[str]] = {
         DEFAULT_TARGET_LABEL: set(DEFAULT_TARGET_PROCESSES),
         "无影云电脑（wuying.exe / stream_viewer.exe）": set(WUYING_FOREGROUND_PROCESSES),
@@ -773,7 +782,9 @@ def visible_applications() -> dict[str, set[str]]:
         if process_name in {"cloudhardwaretypist.exe", "pythonw.exe"}:
             return True
         seen_processes.add(process_name)
-        applications[f"{title}（{process_name}）"] = {process_name}
+        label = f"{title}（{process_name}）"
+        applications[label] = {process_name}
+        application_window_handles[label] = window
         return True
 
     user32.EnumWindows(collect_window, 0)
@@ -967,7 +978,7 @@ def run_automation_monitor_guarded() -> None:
 
 def run_gui() -> None:
     global timing_preset_name, auto_trigger_window_seconds, focus_wait_seconds, enter_wait_seconds
-    global target_process_names, target_application_label
+    global target_process_names, target_application_label, target_window_handle
     root = tk.Tk()
     root.title(WINDOW_TITLE)
     root.geometry("500x570")
@@ -1087,12 +1098,13 @@ def run_gui() -> None:
     application_combo.pack(side="left", fill="x", expand=True, padx=(6, 0))
 
     def change_target_application(_event: object | None = None) -> None:
-        global target_process_names, target_application_label
+        global target_process_names, target_application_label, target_window_handle
         selected = application_var.get()
         if selected not in application_map:
             return
         target_application_label = selected
         target_process_names = set(application_map[selected])
+        target_window_handle = application_window_handles.get(selected)
         publish_status(f"目标：{selected.split('（', 1)[0]}")
 
     def refresh_application_list(_event: object | None = None) -> None:
@@ -1101,8 +1113,15 @@ def run_gui() -> None:
         application_combo.configure(values=list(application_map))
         matching_label = next(
             (
+                label for label, window in application_window_handles.items()
+                if window == target_window_handle
+            ),
+            None,
+        ) if target_window_handle is not None else next(
+            (
                 label for label, process_names in application_map.items()
-                if set(process_names) == set(target_process_names)
+                if label not in application_window_handles
+                and set(process_names) == set(target_process_names)
             ),
             None,
         )
