@@ -414,6 +414,8 @@ shutdown_event = threading.Event()
 clipboard_detection_paused = threading.Event()
 reset_validity_event = threading.Event()
 typing_lock = threading.Lock()
+typing_active_event = threading.Event()
+clipboard_trigger_suppressed_until = 0.0
 status_queue: queue.Queue[str] = queue.Queue()
 health_queue: queue.Queue[str] = queue.Queue()
 clipboard_preview_queue: queue.Queue[str] = queue.Queue()
@@ -591,9 +593,12 @@ def is_chinese_character(character: str) -> bool:
 
 
 def type_clipboard() -> None:
+    global clipboard_trigger_suppressed_until
     if not typing_lock.acquire(blocking=False):
+        typing_active_event.clear()
         publish_status("输入任务正在运行")
         return
+    typing_active_event.set()
     typed_count = 0
     total_count = 0
     final_status = "等待剪贴板更新"
@@ -678,12 +683,18 @@ def type_clipboard() -> None:
         except OSError:
             pass
         typing_lock.release()
+        # VMware Tools can mirror the clipboard immediately after virtual-key
+        # input. Do not interpret that echo as a new user copy operation.
+        clipboard_trigger_suppressed_until = time.monotonic() + 1.0
+        typing_active_event.clear()
         publish_status(final_status)
 
 
 def start_typing_thread() -> None:
-    if typing_lock.locked():
+    if typing_lock.locked() or typing_active_event.is_set():
         return
+    # Close the small race between starting the thread and acquiring the lock.
+    typing_active_event.set()
     threading.Thread(target=type_clipboard, name="cloud-hardware-typist", daemon=True).start()
 
 
@@ -774,6 +785,19 @@ def visible_applications() -> dict[str, set[str]]:
     return applications
 
 
+def should_schedule_clipboard_update(
+    sequence_changed: bool,
+    text_changed: bool,
+    typing_active: bool,
+    now: float,
+    suppressed_until: float,
+) -> bool:
+    """Return True only for a user clipboard update, not a VMware sync echo."""
+    return (sequence_changed or text_changed) and not typing_active and (
+        text_changed or now >= suppressed_until
+    )
+
+
 def run_automation_monitor() -> None:
     """Watch clipboard/focus and automatically type once per clipboard update."""
     last_clipboard_sequence = user32.GetClipboardSequenceNumber()
@@ -794,7 +818,15 @@ def run_automation_monitor() -> None:
             clipboard_text = read_unicode_clipboard()
             last_text_check = now
         text_changed = clipboard_text is not None and clipboard_text != last_clipboard_text
-        if sequence_changed or text_changed:
+        clipboard_updated = sequence_changed or text_changed
+        trigger_update = should_schedule_clipboard_update(
+            sequence_changed,
+            text_changed,
+            typing_active_event.is_set(),
+            now,
+            clipboard_trigger_suppressed_until,
+        )
+        if clipboard_updated:
             clipboard_update_time_queue.put(time.strftime("%H:%M:%S"))
 
         if reset_validity_event.is_set():
@@ -821,10 +853,19 @@ def run_automation_monitor() -> None:
             time.sleep(0.05)
             continue
 
-        if sequence_changed or text_changed:
+        if clipboard_updated:
             last_clipboard_sequence = sequence
             last_clipboard_text = clipboard_text
             clipboard_preview_queue.put(clipboard_text or "")
+
+        if typing_active_event.is_set():
+            # Consume clipboard sequence changes produced by VMware Tools while
+            # typing, but never turn them into another pending typing task.
+            pending_sequence = None
+            time.sleep(0.02)
+            continue
+
+        if trigger_update:
             pending_sequence = sequence
             pending_since = now
             publish_status(f"已更新：{auto_trigger_window_seconds:g} 秒内切换")
