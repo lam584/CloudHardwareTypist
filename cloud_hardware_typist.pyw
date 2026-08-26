@@ -137,6 +137,7 @@ VM_FOREGROUND_PROCESSES = {
     "virt-viewer.exe", "remote-viewer.exe",
 }
 DEFAULT_TARGET_LABEL = "云电脑 / 虚拟机控制台（自动识别）"
+VMWARE_TARGET_LABEL = "VMware Workstation（vmware.exe / vmplayer.exe）"
 DEFAULT_TARGET_PROCESSES = WUYING_FOREGROUND_PROCESSES | VM_FOREGROUND_PROCESSES
 target_process_names = set(DEFAULT_TARGET_PROCESSES)
 target_application_label = DEFAULT_TARGET_LABEL
@@ -186,6 +187,9 @@ def load_settings() -> None:
         ):
             target_application_label = label
             target_process_names = {item.lower() for item in processes}
+            if target_process_names and target_process_names <= {"vmware.exe", "vmplayer.exe"}:
+                target_application_label = VMWARE_TARGET_LABEL
+                target_process_names = {"vmware.exe", "vmplayer.exe"}
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         pass
 
@@ -606,12 +610,13 @@ def running_vmware_config_paths() -> list[Path]:
             index = 0
             while True:
                 try:
-                    _name, value, _kind = winreg.EnumValue(key, index)
+                    name, value, _kind = winreg.EnumValue(key, index)
                 except OSError:
                     break
                 index += 1
-                if isinstance(value, str) and value.lower().endswith(".vmx"):
-                    path = Path(value)
+                path_text = name if name.lower().endswith(".vmx") else value
+                if isinstance(path_text, str) and path_text.lower().endswith(".vmx"):
+                    path = Path(path_text)
                     if path.exists() and path not in paths:
                         paths.append(path)
     except OSError:
@@ -816,9 +821,14 @@ def vmware_vnc_endpoint() -> tuple[str, int]:
     title_length = user32.GetWindowTextLengthW(foreground)
     title_buffer = ctypes.create_unicode_buffer(title_length + 1)
     user32.GetWindowTextW(foreground, title_buffer, title_length + 1)
-    window_title = title_buffer.value.casefold()
-    candidates: list[tuple[str, int]] = []
-    for path in running_vmware_config_paths():
+    foreground_title = title_buffer.value.casefold()
+    saved_target_label = target_application_label.casefold()
+    candidates: list[tuple[str, int, Path]] = []
+    running_paths: list[Path] = []
+    for path in (*vmrun_running_config_paths(), *running_vmware_config_paths()):
+        if path not in running_paths:
+            running_paths.append(path)
+    for path in running_paths:
         try:
             text, _encoding = read_vmx_text(path)
             if (vmx_value(text, "RemoteDisplay.vnc.enabled") or "").upper() != "TRUE":
@@ -826,15 +836,28 @@ def vmware_vnc_endpoint() -> tuple[str, int]:
             port = int(vmx_value(text, "RemoteDisplay.vnc.port") or "")
             display_name = (vmx_value(text, "displayName") or path.stem).casefold()
             if VMWARE_VNC_PORT <= port <= VMWARE_VNC_PORT_MAX:
-                candidates.append((display_name, port))
+                candidates.append((display_name, port, path))
         except (OSError, UnicodeError, ValueError):
             continue
-    matching = [(VMWARE_VNC_HOST, port) for name, port in candidates if name in window_title]
-    if len(matching) == 1:
-        return matching[0]
+    foreground_matching = [
+        (VMWARE_VNC_HOST, port) for name, port, _path in candidates
+        if name in foreground_title
+    ]
+    if len(foreground_matching) == 1:
+        return foreground_matching[0]
+    saved_target_matching = [
+        (VMWARE_VNC_HOST, port) for name, port, _path in candidates
+        if name in saved_target_label
+    ]
+    if not foreground_matching and len(saved_target_matching) == 1:
+        return saved_target_matching[0]
     if len(candidates) == 1:
         return VMWARE_VNC_HOST, candidates[0][1]
-    raise ConnectionError("无法确定当前 VMware 虚拟机的 VNC 端口，请使用“一键配置 VMware VNC”")
+    candidate_names = "、".join(name for name, _port, _path in candidates) or "无"
+    raise ConnectionError(
+        f"无法从当前窗口确定 VMware 虚拟机（运行候选：{candidate_names}），"
+        "请在目标应用中选择具体虚拟机窗口"
+    )
 
 
 def send_scan_code(scancode: int, key_up: bool = False) -> None:
@@ -1072,19 +1095,13 @@ def visible_applications() -> dict[str, set[str]]:
     application_window_handles.clear()
     applications: dict[str, set[str]] = {
         DEFAULT_TARGET_LABEL: set(DEFAULT_TARGET_PROCESSES),
-        "无影云电脑（wuying.exe / stream_viewer.exe）": set(WUYING_FOREGROUND_PROCESSES),
-        "VMware（vmware.exe / vmplayer.exe）": {"vmware.exe", "vmplayer.exe"},
-        "VirtualBox（VirtualBoxVM.exe）": {"virtualboxvm.exe"},
-        "Hyper-V（vmconnect.exe）": {"vmconnect.exe"},
-        "QEMU / SPICE 虚拟机控制台": {
-            "qemu-system-x86_64.exe", "qemu-system-i386.exe",
-            "virt-viewer.exe", "remote-viewer.exe",
-        },
     }
-    seen_processes: set[str] = set()
+    internal_titles = {"default ime", "msctfime ui", "dde server window"}
+    vmware_main_window: int | None = None
 
     @ENUMWINDOWSPROC
     def collect_window(window: int, _parameter: int) -> bool:
+        nonlocal vmware_main_window
         if not user32.IsWindowVisible(window):
             return True
         title_length = user32.GetWindowTextLengthW(window)
@@ -1094,17 +1111,28 @@ def visible_applications() -> dict[str, set[str]]:
         user32.GetWindowTextW(window, title_buffer, title_length + 1)
         title = title_buffer.value.strip()
         process_name = process_name_for_window(window)
-        if not title or not process_name or process_name in seen_processes:
+        if not title or not process_name:
             return True
         if process_name in {"cloudhardwaretypist.exe", "pythonw.exe"}:
             return True
-        seen_processes.add(process_name)
+        normalized_title = title.casefold()
+        if normalized_title in internal_titles or normalized_title.startswith("gdi+ window"):
+            return True
+        if process_name in {"vmware.exe", "vmplayer.exe"}:
+            if vmware_main_window is None or "vmware workstation" in normalized_title:
+                vmware_main_window = window
+            return True
         label = f"{title}（{process_name}）"
+        if label in applications:
+            label = f"{title}（{process_name}，窗口 {window}）"
         applications[label] = {process_name}
         application_window_handles[label] = window
         return True
 
     user32.EnumWindows(collect_window, 0)
+    if vmware_main_window is not None:
+        applications[VMWARE_TARGET_LABEL] = {"vmware.exe", "vmplayer.exe"}
+        application_window_handles[VMWARE_TARGET_LABEL] = vmware_main_window
     return applications
 
 
