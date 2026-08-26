@@ -10,17 +10,23 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from collections.abc import Callable
+import json
+import os
 import queue
 import random
+import re
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import traceback
+import winreg
 from pathlib import Path
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 # Three human-like timing profiles. Every delay is sampled independently.
@@ -85,6 +91,9 @@ auto_trigger_window_seconds = 7.0
 focus_wait_seconds = 4.0
 enter_wait_seconds = 4.0
 
+SETTINGS_DIRECTORY_NAME = "CloudHardwareTypist"
+SETTINGS_FILE_NAME = "settings.json"
+
 
 # Windows constants.
 CF_UNICODETEXT = 13
@@ -138,12 +147,78 @@ MUTEX_NAME = "Local\\CloudHardwareTypist-8DDA2254-3A4E-4C74-91A0-FB0D74F21F26"
 WINDOW_TITLE = "云端逐键输入助手"
 SW_RESTORE = 9
 
+
+def settings_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    return base / SETTINGS_DIRECTORY_NAME / SETTINGS_FILE_NAME
+
+
+def load_settings() -> None:
+    """Load valid per-user preferences, leaving defaults for missing/bad values."""
+    global timing_preset_name, auto_trigger_window_seconds, focus_wait_seconds, enter_wait_seconds
+    global target_process_names, target_application_label
+    try:
+        data = json.loads(settings_path().read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+
+        preset = data.get("timing_preset")
+        if preset in TIMING_PRESETS:
+            timing_preset_name = preset
+
+        numeric_settings = (
+            ("auto_trigger_window_seconds", 1.0, 120.0),
+            ("focus_wait_seconds", 0.0, 30.0),
+            ("enter_wait_seconds", 0.0, 60.0),
+        )
+        for name, minimum, maximum in numeric_settings:
+            value = data.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                globals()[name] = min(maximum, max(minimum, float(value)))
+
+        label = data.get("target_application_label")
+        processes = data.get("target_process_names")
+        if (
+            isinstance(label, str) and label.strip()
+            and isinstance(processes, list) and processes
+            and all(isinstance(item, str) and item.strip() for item in processes)
+        ):
+            target_application_label = label
+            target_process_names = {item.lower() for item in processes}
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+
+def save_settings() -> None:
+    """Atomically save the current per-user preferences."""
+    destination = settings_path()
+    temporary = destination.with_suffix(".tmp")
+    data = {
+        "version": 1,
+        "timing_preset": timing_preset_name,
+        "auto_trigger_window_seconds": auto_trigger_window_seconds,
+        "focus_wait_seconds": focus_wait_seconds,
+        "enter_wait_seconds": enter_wait_seconds,
+        "target_application_label": target_application_label,
+        "target_process_names": sorted(target_process_names),
+    }
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(destination)
+    except OSError as error:
+        append_runtime_log(f"保存设置失败：{error}")
+
 SC_LEFT_SHIFT = 0x2A
 SC_ENTER = 0x1C
 SC_TAB = 0x0F
 SC_SPACE = 0x39
 VMWARE_VNC_HOST = "127.0.0.1"
 VMWARE_VNC_PORT = 5905
+VMWARE_VNC_PORT_MAX = 5999
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -521,6 +596,247 @@ def send_vnc_character(client: RfbKeyboardClient, character: str) -> bool:
     return not cancel_event.is_set()
 
 
+def running_vmware_config_paths() -> list[Path]:
+    """Return VMware's registered VMX paths without assuming a fixed library location."""
+    paths: list[Path] = []
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Software\VMware, Inc.\Running VM List"
+        ) as key:
+            index = 0
+            while True:
+                try:
+                    _name, value, _kind = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                index += 1
+                if isinstance(value, str) and value.lower().endswith(".vmx"):
+                    path = Path(value)
+                    if path.exists() and path not in paths:
+                        paths.append(path)
+    except OSError:
+        pass
+    return paths
+
+
+def vmrun_running_config_paths() -> list[Path]:
+    vmrun = find_vmrun()
+    if vmrun is None:
+        return []
+    try:
+        result = subprocess.run(
+            [str(vmrun), "-T", "ws", "list"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [
+        Path(line.strip()) for line in result.stdout.splitlines()
+        if line.strip().lower().endswith(".vmx") and Path(line.strip()).is_file()
+    ]
+
+
+def inventory_vmware_config_paths() -> list[Path]:
+    inventory = Path(os.environ.get("APPDATA", "")) / "VMware" / "inventory.vmls"
+    if not inventory.is_file():
+        return []
+    try:
+        text, _encoding = read_vmx_text(inventory)
+    except OSError:
+        return []
+    paths: list[Path] = []
+    for value in re.findall(r'(?im)^vmlist\d+\.config\s*=\s*"([^"]+)"', text):
+        path = Path(value)
+        if path.is_file() and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def discover_vmware_config_paths() -> tuple[list[Path], set[Path]]:
+    running = set(vmrun_running_config_paths())
+    discovered: list[Path] = []
+    for path in (*running, *running_vmware_config_paths(), *inventory_vmware_config_paths()):
+        if path.is_file() and path not in discovered:
+            discovered.append(path)
+    return discovered, running
+
+
+def scan_vmx_files(
+    directory: Path,
+    cancel: threading.Event,
+    progress: Callable[[int, int], None] | None = None,
+) -> list[Path]:
+    """Recursively scan off the GUI thread while pruning irrelevant lock/system trees."""
+    found: list[Path] = []
+    scanned_directories = 0
+    last_reported_found = 0
+    skipped_names = {"$recycle.bin", "system volume information"}
+    for current, directories, files in os.walk(directory, onerror=lambda _error: None):
+        if cancel.is_set():
+            break
+        directories[:] = [
+            name for name in directories
+            if name.casefold() not in skipped_names
+            and not name.casefold().endswith(".lck")
+            and ".lck.codex-stale-" not in name.casefold()
+        ]
+        scanned_directories += 1
+        for name in files:
+            if name.casefold().endswith(".vmx"):
+                found.append(Path(current) / name)
+        if progress is not None and (
+            scanned_directories % 50 == 0 or len(found) != last_reported_found
+        ):
+            progress(scanned_directories, len(found))
+            last_reported_found = len(found)
+    if progress is not None:
+        progress(scanned_directories, len(found))
+    return sorted(found)
+
+
+def read_vmx_text(path: Path) -> tuple[str, str]:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("latin-1"), "latin-1"
+
+
+def vmx_value(text: str, key: str) -> str | None:
+    match = re.search(
+        rf"(?im)^\s*{re.escape(key)}\s*=\s*\"([^\"]*)\"\s*$", text
+    )
+    return match.group(1) if match else None
+
+
+def vmx_is_locked(path: Path) -> bool:
+    return (path.parent / (path.name + ".lck")).exists()
+
+
+def same_windows_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def vmx_is_running(path: Path) -> bool:
+    return any(same_windows_path(path, running) for running in vmrun_running_config_paths())
+
+
+def archive_stale_vmx_lock(path: Path) -> Path | None:
+    """Move a non-active VM's leftover lock aside so it remains recoverable."""
+    lock_path = path.parent / (path.name + ".lck")
+    if not lock_path.exists():
+        return None
+    if vmx_is_running(path):
+        raise PermissionError("虚拟机仍在运行，不能处理其 VMX 配置锁")
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    archived = path.parent / (lock_path.name + f".codex-stale-{timestamp}")
+    suffix = 1
+    while archived.exists():
+        archived = path.parent / (lock_path.name + f".codex-stale-{timestamp}-{suffix}")
+        suffix += 1
+    lock_path.replace(archived)
+    return archived
+
+
+def find_vmrun() -> Path | None:
+    candidates = (
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        / "VMware" / "VMware Workstation" / "vmrun.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        / "VMware" / "VMware Workstation" / "vmrun.exe",
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def suspend_vmware_vm(path: Path, timeout_seconds: float = 60.0) -> None:
+    """Soft-suspend one VM and wait until VMware releases its VMX lock."""
+    vmrun = find_vmrun()
+    if vmrun is None:
+        raise FileNotFoundError("未找到 VMware vmrun.exe")
+    startup_info = subprocess.STARTUPINFO()
+    startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    result = subprocess.run(
+        [str(vmrun), "-T", "ws", "suspend", str(path), "soft"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_seconds,
+        startupinfo=startup_info,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail or f"vmrun 返回错误代码 {result.returncode}")
+    deadline = time.monotonic() + timeout_seconds
+    while vmx_is_running(path) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if vmx_is_running(path):
+        raise TimeoutError("挂起已执行，但虚拟机仍出现在 VMware 运行列表中")
+    archive_stale_vmx_lock(path)
+
+
+def configure_vmx_vnc(path: Path, port: int) -> Path:
+    """Back up and atomically add/update localhost-only VMware VNC settings."""
+    if vmx_is_running(path):
+        raise PermissionError("虚拟机仍在运行，请先完成挂起")
+    archive_stale_vmx_lock(path)
+    text, encoding = read_vmx_text(path)
+    settings = {
+        "RemoteDisplay.vnc.enabled": "TRUE",
+        "RemoteDisplay.vnc.ip": VMWARE_VNC_HOST,
+        "RemoteDisplay.vnc.port": str(port),
+    }
+    for key, value in settings.items():
+        pattern = re.compile(rf"(?im)^\s*{re.escape(key)}\s*=.*$")
+        replacement = f'{key} = "{value}"'
+        text, count = pattern.subn(replacement, text)
+        if count == 0:
+            text = text.rstrip("\r\n") + "\r\n" + replacement + "\r\n"
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(path.name + f".codex-backup-{timestamp}")
+    suffix = 1
+    while backup.exists():
+        backup = path.with_name(path.name + f".codex-backup-{timestamp}-{suffix}")
+        suffix += 1
+    backup.write_bytes(path.read_bytes())
+    temporary = path.with_name(path.name + ".vnc-config.tmp")
+    temporary.write_bytes(text.encode(encoding))
+    temporary.replace(path)
+    return backup
+
+
+def vmware_vnc_endpoint() -> tuple[str, int]:
+    """Resolve the focused VMware VM's configured port instead of assuming 5905."""
+    foreground = user32.GetForegroundWindow()
+    title_length = user32.GetWindowTextLengthW(foreground)
+    title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+    user32.GetWindowTextW(foreground, title_buffer, title_length + 1)
+    window_title = title_buffer.value.casefold()
+    candidates: list[tuple[str, int]] = []
+    for path in running_vmware_config_paths():
+        try:
+            text, _encoding = read_vmx_text(path)
+            if (vmx_value(text, "RemoteDisplay.vnc.enabled") or "").upper() != "TRUE":
+                continue
+            port = int(vmx_value(text, "RemoteDisplay.vnc.port") or "")
+            display_name = (vmx_value(text, "displayName") or path.stem).casefold()
+            if VMWARE_VNC_PORT <= port <= VMWARE_VNC_PORT_MAX:
+                candidates.append((display_name, port))
+        except (OSError, UnicodeError, ValueError):
+            continue
+    matching = [(VMWARE_VNC_HOST, port) for name, port in candidates if name in window_title]
+    if len(matching) == 1:
+        return matching[0]
+    if len(candidates) == 1:
+        return VMWARE_VNC_HOST, candidates[0][1]
+    raise ConnectionError("无法确定当前 VMware 虚拟机的 VNC 端口，请使用“一键配置 VMware VNC”")
+
+
 def send_scan_code(scancode: int, key_up: bool = False) -> None:
     # VMware Workstation reads its console keyboard through a legacy Windows
     # keyboard path on some host configurations and silently discards SendInput
@@ -627,7 +943,8 @@ def type_clipboard() -> None:
 
         total_count = len(text.replace("\r", ""))
         if foreground_process_name() in {"vmware.exe", "vmplayer.exe"}:
-            vnc_client = RfbKeyboardClient(VMWARE_VNC_HOST, VMWARE_VNC_PORT)
+            vnc_host, vnc_port = vmware_vnc_endpoint()
+            vnc_client = RfbKeyboardClient(vnc_host, vnc_port)
             publish_status("VMware 虚拟键盘：正在输入 0 / " + str(total_count))
         else:
             publish_status(f"正在输入：0 / {total_count}")
@@ -981,8 +1298,16 @@ def run_gui() -> None:
     global target_process_names, target_application_label, target_window_handle
     root = tk.Tk()
     root.title(WINDOW_TITLE)
-    root.geometry("500x570")
+    root.geometry("500x620")
     root.resizable(False, False)
+
+    save_after_id: str | None = None
+
+    def schedule_settings_save() -> None:
+        nonlocal save_after_id
+        if save_after_id is not None:
+            root.after_cancel(save_after_id)
+        save_after_id = root.after(250, save_settings)
 
     style = ttk.Style(root)
     try:
@@ -1087,6 +1412,8 @@ def run_gui() -> None:
     target_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(3, 0))
     ttk.Label(target_row, text="目标应用：", style="Body.TLabel").pack(side="left")
     application_map = visible_applications()
+    if target_application_label not in application_map:
+        application_map[target_application_label] = set(target_process_names)
     application_var = tk.StringVar(value=target_application_label)
     application_combo = ttk.Combobox(
         target_row,
@@ -1105,11 +1432,14 @@ def run_gui() -> None:
         target_application_label = selected
         target_process_names = set(application_map[selected])
         target_window_handle = application_window_handles.get(selected)
+        schedule_settings_save()
         publish_status(f"目标：{selected.split('（', 1)[0]}")
 
     def refresh_application_list(_event: object | None = None) -> None:
         nonlocal application_map
         application_map = visible_applications()
+        if target_application_label not in application_map:
+            application_map[target_application_label] = set(target_process_names)
         application_combo.configure(values=list(application_map))
         matching_label = next(
             (
@@ -1143,6 +1473,7 @@ def run_gui() -> None:
             enter_wait_seconds = min(60.0, max(0.0, float(enter_wait_var.get())))
         except (tk.TclError, ValueError):
             return
+        schedule_settings_save()
 
     trigger_window_var.trace_add("write", apply_wait_settings)
     focus_wait_var.trace_add("write", apply_wait_settings)
@@ -1164,6 +1495,7 @@ def run_gui() -> None:
         timing_preset_name = preset_display_to_key[preset_var.get()]
         profile = TIMING_PRESETS[timing_preset_name]
         low, high = profile["character"]
+        schedule_settings_save()
         publish_status(f"速度：{profile['label']}（{low}–{high} ms）")
 
     preset_combo = ttk.Combobox(
@@ -1185,6 +1517,7 @@ def run_gui() -> None:
 
     def request_close() -> None:
         cancel_event.set()
+        save_settings()
         shutdown_event.set()
 
     def request_reset_validity() -> None:
@@ -1202,6 +1535,242 @@ def run_gui() -> None:
             pause_button.configure(text="恢复剪贴板检测")
             publish_status("检测已暂停，任务已取消")
 
+    def configure_vmware_vnc() -> None:
+        detected, running_paths = discover_vmware_config_paths()
+        dialog = tk.Toplevel(root)
+        dialog.title("配置 VMware VNC")
+        dialog.geometry("820x430")
+        dialog.minsize(700, 360)
+        dialog.transient(root)
+        dialog.grab_set()
+        scan_cancel = threading.Event()
+
+        def close_dialog() -> None:
+            scan_cancel.set()
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+        ttk.Label(
+            dialog,
+            text=(
+                "已自动扫描当前运行的虚拟机和 VMware 本地库存。"
+                "可选择一项或多项；运行中的虚拟机会在确认后先完整挂起。"
+            ),
+            wraplength=770,
+        ).pack(anchor="w", padx=14, pady=(14, 8))
+
+        tree_frame = ttk.Frame(dialog)
+        tree_frame.pack(fill="both", expand=True, padx=14)
+        tree = ttk.Treeview(
+            tree_frame, columns=("status", "config", "folder"), show="headings",
+            selectmode="extended",
+        )
+        tree.heading("status", text="状态")
+        tree.heading("config", text="配置文件")
+        tree.heading("folder", text="文件夹路径")
+        tree.column("status", width=125, stretch=False)
+        tree.column("config", width=190, stretch=False)
+        tree.column("folder", width=440)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        item_paths: dict[str, Path] = {}
+
+        empty_var = tk.StringVar(value="")
+        ttk.Label(dialog, textvariable=empty_var).pack(anchor="w", padx=14, pady=(6, 0))
+
+        def add_paths(paths: list[Path], running: set[Path] | None = None) -> None:
+            running = running or set()
+            known = set(item_paths.values())
+            for path in paths:
+                if path in known or not path.is_file():
+                    continue
+                is_running = path in running
+                status = "运行中（将挂起）" if is_running else "未运行（可配置）"
+                item = tree.insert("", "end", values=(status, path.name, str(path.parent)))
+                item_paths[item] = path
+                known.add(path)
+            children = tree.get_children()
+            if children:
+                tree.selection_set(children)
+                empty_var.set(f"共找到 {len(children)} 个虚拟机配置；可按 Ctrl/Shift 调整选择。")
+            else:
+                empty_var.set("自动扫描未找到可用的 .vmx，请点击“选择文件夹”。")
+
+        add_paths(detected, running_paths)
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill="x", padx=14, pady=14)
+        apply_button_text = tk.StringVar(value="确认配置所选项")
+
+        def update_apply_button_text(_event: object | None = None) -> None:
+            selected = tree.selection()
+            has_running = any(
+                tree.set(item, "status").startswith("运行中")
+                for item in selected if item in item_paths
+            )
+            apply_button_text.set(
+                "确认挂起并配置所选项" if has_running else "确认配置所选项"
+            )
+
+        tree.bind("<<TreeviewSelect>>", update_apply_button_text)
+        update_apply_button_text()
+
+        def choose_folder() -> None:
+            directory = filedialog.askdirectory(
+                title="选择包含一个或多个 VMware 虚拟机的文件夹", parent=dialog
+            )
+            if not directory:
+                return
+            scan_cancel.clear()
+            scan_events: queue.Queue[tuple[object, ...]] = queue.Queue()
+            apply_button.configure(state="disabled")
+            folder_button.configure(state="disabled")
+            empty_var.set(f"正在后台扫描 {directory} …")
+
+            def report_progress(scanned_count: int, found_count: int) -> None:
+                scan_events.put(("progress", scanned_count, found_count))
+
+            def scan_worker() -> None:
+                scanned = scan_vmx_files(Path(directory), scan_cancel, report_progress)
+                scan_events.put(("done", scanned))
+
+            def poll_scan() -> None:
+                latest_progress: tuple[object, ...] | None = None
+                try:
+                    while True:
+                        event = scan_events.get_nowait()
+                        if event[0] == "progress":
+                            latest_progress = event
+                        elif event[0] == "done":
+                            scanned = list(event[1])
+                            apply_button.configure(state="normal")
+                            folder_button.configure(state="normal")
+                            if not scanned:
+                                empty_var.set(f"扫描完成：未在 {directory} 中找到 .vmx 文件。")
+                            else:
+                                add_paths(scanned, set(vmrun_running_config_paths()))
+                            return
+                except queue.Empty:
+                    pass
+                if latest_progress is not None:
+                    empty_var.set(
+                        f"正在后台扫描 {directory}：已检查 {latest_progress[1]} 个目录，"
+                        f"找到 {latest_progress[2]} 个配置…"
+                    )
+                if dialog.winfo_exists():
+                    dialog.after(100, poll_scan)
+
+            threading.Thread(target=scan_worker, name="vmx-folder-scan", daemon=True).start()
+            dialog.after(100, poll_scan)
+
+        def apply_selected() -> None:
+            selected = list(tree.selection())
+            if not selected:
+                messagebox.showwarning("未选择", "请先选择至少一个虚拟机。", parent=dialog)
+                return
+            paths = [item_paths[item] for item in selected]
+            current_running = set(vmrun_running_config_paths())
+            running_selected = [path for path in paths if path in current_running]
+            if running_selected:
+                locked_names = "\n".join(f"• {path}" for path in running_selected)
+                if not messagebox.askyesno(
+                    "确认完整挂起并配置",
+                    "将软挂起以下运行中的虚拟机：\n\n" + locked_names
+                    + "\n\n挂起完成后备份并修改 VMX；配置后不会自动恢复。是否继续？",
+                    parent=dialog,
+                ):
+                    return
+
+            apply_button.configure(state="disabled")
+            folder_button.configure(state="disabled")
+            close_button.configure(state="disabled")
+            tree.configure(selectmode="none")
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+            progress_queue: queue.Queue[tuple[object, ...]] = queue.Queue()
+
+            def worker() -> None:
+                configured: list[str] = []
+                failed: list[str] = []
+                failed_paths: set[Path] = set()
+                for path in running_selected:
+                    progress_queue.put(("progress", f"正在完整挂起：{path.name}…"))
+                    try:
+                        suspend_vmware_vm(path)
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                        failed.append(f"{path}: 自动挂起失败：{error}")
+                        failed_paths.add(path)
+
+                used_ports: set[int] = set()
+                for path in paths:
+                    if path in failed_paths:
+                        continue
+                    progress_queue.put(("progress", f"正在备份并配置：{path.name}…"))
+                    try:
+                        text, _encoding = read_vmx_text(path)
+                        existing_text = vmx_value(text, "RemoteDisplay.vnc.port")
+                        existing = int(existing_text) if existing_text else None
+                        port = existing if existing and VMWARE_VNC_PORT <= existing <= VMWARE_VNC_PORT_MAX else None
+                        if port is None or port in used_ports:
+                            port = next(candidate for candidate in range(
+                                VMWARE_VNC_PORT, VMWARE_VNC_PORT_MAX + 1
+                            ) if candidate not in used_ports)
+                        backup = configure_vmx_vnc(path, port)
+                        used_ports.add(port)
+                        configured.append(f"{path.name} → 127.0.0.1:{port}\n  备份：{backup.name}")
+                    except (OSError, UnicodeError, ValueError, StopIteration) as error:
+                        failed.append(f"{path}: {error}")
+                progress_queue.put(("done", configured, failed))
+
+            def poll_worker() -> None:
+                try:
+                    while True:
+                        event = progress_queue.get_nowait()
+                        if event[0] == "progress":
+                            empty_var.set(str(event[1]))
+                        elif event[0] == "done":
+                            configured = list(event[1])
+                            failed = list(event[2])
+                            summary = ""
+                            if configured:
+                                summary = "配置成功：\n" + "\n".join(configured)
+                            if failed:
+                                summary += ("\n\n" if summary else "") + "未配置：\n" + "\n".join(failed)
+                            if configured:
+                                summary += "\n\n请启动或恢复虚拟机，使 VNC 配置生效。"
+                            messagebox.showinfo("VMware VNC 配置结果", summary, parent=dialog)
+                            if configured:
+                                dialog.destroy()
+                            else:
+                                apply_button.configure(state="normal")
+                                folder_button.configure(state="normal")
+                                close_button.configure(state="normal")
+                                tree.configure(selectmode="extended")
+                                dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+                            return
+                except queue.Empty:
+                    pass
+                if dialog.winfo_exists():
+                    dialog.after(100, poll_worker)
+
+            threading.Thread(target=worker, name="vmware-vnc-config", daemon=True).start()
+            dialog.after(100, poll_worker)
+
+        apply_button = ttk.Button(
+            button_frame, textvariable=apply_button_text, command=apply_selected,
+            style="Action.TButton",
+        )
+        apply_button.pack(side="left")
+        folder_button = ttk.Button(
+            button_frame, text="选择文件夹", command=choose_folder,
+            style="Action.TButton",
+        )
+        folder_button.pack(side="left", padx=(10, 0))
+        close_button = ttk.Button(button_frame, text="关闭", command=close_dialog)
+        close_button.pack(side="right")
+
     ttk.Button(
         button_row, text="停止当前输入", command=request_cancel,
         style="Control.TButton", width=14,
@@ -1215,6 +1784,10 @@ def run_gui() -> None:
         style="Control.TButton", width=16,
     )
     pause_button.grid(row=0, column=2, padx=(6, 0))
+    ttk.Button(
+        button_row, text="一键配置 VMware VNC", command=configure_vmware_vnc,
+        style="Control.TButton", width=24,
+    ).grid(row=1, column=0, columnspan=3, pady=(8, 0))
 
     root.protocol("WM_DELETE_WINDOW", request_close)
 
@@ -1257,6 +1830,7 @@ def run_gui() -> None:
                     text=f"剪贴板内容预览｜上次更新时间：{latest_update_time}"
                 )
         if shutdown_event.is_set():
+            save_settings()
             root.destroy()
             return
         root.after(50, refresh_gui)
@@ -1272,6 +1846,7 @@ def run_gui() -> None:
 
 
 def main() -> None:
+    load_settings()
     ctypes.set_last_error(0)
     mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if not mutex_handle:
